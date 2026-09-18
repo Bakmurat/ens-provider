@@ -1,0 +1,38 @@
+{{- $ns := .Values.namespace -}}
+# =============================================================================
+# PodDisruptionBudgets (PoC hardening G5). Two DIFFERENT shapes on purpose:
+#
+#  - cluster-autoscaler: replicas=2 + leader-elect → minAvailable 1 keeps a
+#    leader available across VOLUNTARY disruptions (node drain, rollout). Real
+#    protection.
+#
+#  - ens-provider: maxUnavailable:1 works in BOTH modes (C-09):
+#      single replica (HA off): a minAvailable:1 PDB would make node drains
+#      BLOCK FOREVER (0 disruptions allowed on 1 pod); maxUnavailable:1
+#      documents the object as disruptible and never blocks a drain.
+#      HA on (2 replicas, BOTH kubelet-Ready — readiness is NOT leadership-
+#      gated, C-14): healthy=2 → disruptionsAllowed=1 — evicting the LEADER
+#      is allowed (failover ~seconds IS the disruption tolerance) while
+#      evicting both pods at once stays blocked.
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cluster-autoscaler
+  namespace: {{ $ns }}
+  labels: { app: cluster-autoscaler, autoscaler/component: ca-core }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: cluster-autoscaler }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ens-provider
+  namespace: {{ $ns }}
+  labels: { app: ens-provider, autoscaler/component: ca-provider }
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: ens-provider }

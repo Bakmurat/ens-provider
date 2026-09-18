@@ -1,0 +1,146 @@
+# Defaults. The per-cluster facts (cluster.id, edgeGroups, ens.*, rrsa.*) are
+# supplied per cluster in your own values file (for example from Terraform
+# outputs); those values override these defaults.
+namespace: kube-system
+
+cluster:
+  id: ""              # REQUIRED (the ACK cluster id)
+  region: ap-southeast-1
+
+# MULTI-GROUP (preferred): one entry per ENS edge nodepool = one CA node group.
+# Each entry uses snake_case
+# keys (the provider parses them directly) and inherits the shared ens.* defaults
+# below for anything it omits (network/vswitch/sg/image/disk/keypair).
+#   - id:            "<nodepool-id>"     # CA node-group id (== nodepool id)
+#     nodepool_id:   "<nodepool-id>"
+#     name_prefix:   "<cluster>-metrics"  # UNIQUE ENS InstanceName prefix
+#     min: 0
+#     max: 5
+#     instance_type: "ens.sn1.large"
+#     labels:  { tier: metrics, cgroupV2: enabled }
+#     taints:  [ { key: tier, value: metrics, effect: NoSchedule } ]
+#     template:{ cpu: "8", memory: "15938184Ki", pods: "64", ephemeral: "40900288Ki",
+#                cpu_alloc: "7920m", mem_alloc: "15370888Ki" }
+#     # pods = per-node cap from node_cidr_mask (/26 => 64 here), NOT the SKU max
+edgeGroups: []
+
+ens:
+  region: ens-region-1
+  networkId: ""       # REQUIRED
+  vswitchId: ""       # REQUIRED
+  securityGroupId: "" # REQUIRED (fallback; each edgeGroup carries its own SG)
+  instanceType: ens.sn1.small
+  imageId: alibaba_cloud_linux_3.2104_x64_20G_20240527
+  diskCategory: local_ssd
+  diskSize: "50"
+  keypair: ens-provider-key
+  publicIp: "false"   # PRIVATE workers: cloud<->edge over the line, egress via ENS NAT
+
+# RRSA (no static keys): the provider assumes this role via a projected SA token.
+rrsa:
+  roleArn: ""         # REQUIRED  acs:ram::<acct>:role/<env>-ens-provider
+  oidcProviderArn: "" # REQUIRED  acs:ram::<acct>:oidc-provider/ack-rrsa-<cid>
+  oidcTokenFile: /var/run/secrets/tokens/sts-token
+
+autoscaler:
+  image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.32.1
+  scanInterval: 10s
+  replicas: 2                  # HA (leader-elect)
+  # tunables learned from testing
+  maxNodeProvisionTime: 15m
+  # recommended profile; validation used 2m/2m for fast test cycles
+  scaleDownDelayAfterAdd: 5m
+  scaleDownUnneededTime: 10m
+  # INVARIANT I3: must exceed provider.nodeAutonomyDuration (10m) — see
+  # the design notes for the full rationale (partial line flap).
+  scaleDownUnreadyTime: 15m
+  # gRPC deadline for CA->provider calls (cloud-config grpc_timeout).
+  grpcTimeout: 30s
+  # Extra POD-TEMPLATE labels merged onto the cluster-autoscaler pods. Empty by
+  # default so flag-off consumers render byte-identically. Set per
+  # cluster in the overlay to opt in — e.g. `{ elk: cluster-autoscaler }` makes
+  # Fluent Bit ship this pod's logs to Kafka/ELK (pods without an `elk` label
+  # are dropped by the pipeline's add_labels->droplog rule).
+  podLabels: {}
+
+provider:
+  # REQUIRED — the Go externalgrpc server image built from this repository:
+  #   make image push VERSION=vX.Y.Z REGISTRY=registry.example.com/<namespace>
+  #   (the Makefile appends IMAGE=ens-provider itself - do NOT include it in REGISTRY)
+  # e.g. registry.example.com/<namespace>/ens-provider:v0.1.0
+  image: ""
+  listenAddr: "0.0.0.0:8086"
+  # Join download source: public (default; ENS NAT) | private (internal OSS
+  # over the dedicated line - requires the TR oss-* statics; see the hardening checklist).
+  imageRepoType: "public"
+  # Additional STATIC imagePullSecrets for the provider SA (e.g. a registry
+  # fixed-password secret "registry-pull-static") - fallback if a managed
+  # credential helper stalls. Default: none.
+  extraImagePullSecrets: []
+  # Extra POD-TEMPLATE labels merged onto the ens-provider pods. Empty by
+  # default so flag-off consumers render byte-identically (this key is
+  # also OMITTED from the flag-off checksum, like leaderElection, so adding it
+  # never rolls flag-off pods). Set per cluster in the overlay — e.g.
+  # `{ elk: ens-provider }` opts the provider's logs into Fluent Bit->Kafka/ELK.
+  podLabels: {}
+  # stale-Node cleanup (v0.1.19): reap Node objects of confirmed-gone
+  # instances (the at-floor T7 gap). String "true"/"false"; grace is a Go
+  # duration. NOTE deliberately NOT `| default true` on a bool - sprig's
+  # default swallows false; these are strings end to end.
+  janitorNodeCleanup: "true"
+  nodeCleanupGrace: "5m"
+  describeCacheTtl: "10"
+  providerIdReconcileSeconds: "15"
+  # Edge-node autonomy (official-docs audit 2026-07-14): OFF by default in ACK
+  # Edge, and without it a >5-min cloud-edge line flap evicts every edge pod.
+  # The provider stamps this per-node ANNOTATION on all managed nodes:
+  #   "10m"/"500s"  -> node.alibabacloud.com/autonomy-duration (bounded; K8s>=1.28;
+  #                    survives flaps, still frees pods of dead nodes for CA)
+  #   "unbounded"   -> node.beta.openyurt.io/autonomy=true
+  #   "off"         -> skip
+  nodeAutonomyDuration: "10m"
+  # janitor: alert threshold for running-but-unjoined instances; auto-release
+  # stays OFF unless janitorRelease is explicitly true (alert-first, design record §12.5)
+  joinTimeout: "30m"
+  # join-token validity (v0.1.23): one scale-up wave shares one
+  # attach token; this sets its expiry explicitly. "2h" = twice Alibaba's
+  # documented 1h default validity (headroom for boot delays + the join
+  # retry tail). Domain: "0" (omit -> Alibaba's 1h default) or 1h..24h.
+  joinTokenTtl: "2h"
+  metricsAddr: "0.0.0.0:9090"
+  janitorRelease: "false"
+  # readiness (Issue 3): gRPC readiness is gated on Kubernetes reachability.
+  # Positive durations only (the provider FATAL-exits on <=0).
+  readinessCheckInterval: "10s"
+  readinessCheckTimeout: "5s"
+  # Active-passive HA (v0.1.25+, design review). enabled=true renders:
+  # replicas 2, RollingUpdate (surge needs a 3rd free cloud node), the
+  # leader-label Service selector (ens-provider.io/role=leader — CA reaches
+  # ONLY the elected leader), Lease+pods RBAC, downward-API identity and the
+  # LEADER_* env. Both pods stay kubelet-Ready (readiness = K8s reachability
+  # only); leadership is enforced by the provider's fail-closed interceptor
+  # and label routing, NOT by pod readiness — a permanently-NotReady
+  # follower would wedge helm wait / the Flux HelmRelease (C-14).
+  # `enabled` is a REAL boolean tested with a direct `if` (never sprig
+  # `default` — it swallows false); the checksum EXCLUDES this subtree while
+  # disabled so adding it cannot roll flag-off consumers (C-07).
+  leaderElection:
+    enabled: false
+    # client-go inequalities (validated at provider startup):
+    # leaseDuration > renewDeadline > 1.2*retryPeriod. CA-style defaults;
+    # crash failover ≈ leaseDuration+retry, graceful handoff ≈ seconds.
+    leaseDuration: "15s"
+    renewDeadline: "10s"
+    retryPeriod: "2s"
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
+runtimeVersion: "1.6.39"
+k8sVersion: "1.32.1-aliyun.1"
+
+# NOTE: this chart ships NO observability manifests (no VMServiceScrape/VMRules).
+# Removed 2026-07-26 by decision - the UAT cluster had no monitoring stack at the time, and scrape
+# config belongs with the monitoring layer that owns the CRDs, not here.
+# CA and the provider still EXPOSE /metrics; add scrape objects in the
+# monitoring layer if/when it lands.

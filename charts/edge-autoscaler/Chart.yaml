@@ -1,0 +1,16 @@
+apiVersion: v2
+name: edge-autoscaler
+description: >-
+  Cluster Autoscaler for Alibaba Cloud ACK@Edge ENS edge nodepools — upstream
+  cluster-autoscaler core + a custom externalgrpc ENS cloud-provider. Packages
+  RBAC, the provider (RRSA-authenticated) and CA core. Values are supplied
+  per cluster (for example from Terraform outputs).
+type: application
+# 0.1.6: gated per-component `podLabels` knob (autoscaler + provider), empty by
+# default. Flag-off (leaderElection off AND both podLabels empty) stays
+# byte-identical to 0.1.5/0.1.4 — the provider flag-off checksum omits
+# podLabels, mirroring leaderElection. Used to attach the Fluent Bit `elk`
+# log-routing label per cluster in the overlay.
+version: 0.1.6
+appVersion: "1.32.1"
+keywords: [cluster-autoscaler, ack-edge, ens, externalgrpc]

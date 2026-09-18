@@ -1,0 +1,232 @@
+{{- $ns := .Values.namespace -}}
+{{- if not .Values.cluster.id }}{{ fail "cluster.id is required — supply it in your values file" }}{{- end }}
+{{- if not .Values.rrsa.roleArn }}{{ fail "rrsa.roleArn is required" }}{{- end }}
+{{- if not .Values.provider.image }}{{ fail "provider.image is required — build and push the provider image (make image push VERSION=vX.Y.Z REGISTRY=registry.example.com/<namespace>) and set provider.image" }}{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ens-provider-config
+  namespace: {{ $ns }}
+  labels: { app: ens-provider }
+data:
+  # ---- shared ENS defaults (a node group may override any of these) ----
+  ENS_REGION: {{ .Values.ens.region | quote }}
+  CONTROL_REGION: {{ .Values.cluster.region | quote }}
+  IMAGE_ID: {{ .Values.ens.imageId | quote }}
+  INSTANCE_TYPE: {{ .Values.ens.instanceType | quote }}
+  NETWORK_ID: {{ .Values.ens.networkId | quote }}
+  VSWITCH_ID: {{ .Values.ens.vswitchId | quote }}
+  SECURITY_GROUP_ID: {{ .Values.ens.securityGroupId | quote }}
+  DISK_CATEGORY: {{ .Values.ens.diskCategory | quote }}
+  DISK_SIZE: {{ .Values.ens.diskSize | quote }}
+  KEYPAIR: {{ .Values.ens.keypair | quote }}
+  PUBLIC_IP: {{ .Values.ens.publicIp | default "false" | quote }}
+  CLUSTER_ID: {{ .Values.cluster.id | quote }}
+  K8S_VERSION: {{ .Values.k8sVersion | quote }}
+  RUNTIME_VERSION: {{ .Values.runtimeVersion | quote }}
+  LISTEN_ADDR: {{ .Values.provider.listenAddr | quote }}
+  DESCRIBE_CACHE_TTL: {{ .Values.provider.describeCacheTtl | quote }}
+  PROVIDERID_RECONCILE_SECONDS: {{ .Values.provider.providerIdReconcileSeconds | quote }}
+  # edge-node autonomy (per-node annotation, stamped by the reconciler):
+  # a duration ("10m"/"500s") = bounded autonomy; "unbounded" = openyurt
+  # autonomy=true; "off" = don't annotate. See official-docs audit 2026-07-14.
+  NODE_AUTONOMY_DURATION: {{ .Values.provider.nodeAutonomyDuration | default "10m" | quote }}
+  # janitor (v0.1.9, design plan): ALWAYS alerts on owned instances that are
+  # Running-but-unjoined past JOIN_TIMEOUT or in dead states (Stopped/Expired);
+  # releases ONLY when JANITOR_RELEASE=true AND no Node correlates. Age alone
+  # never releases (design record §12.5).
+  # Join download source (v0.1.18, hardening checklist item D1): "public" (default, via the ENS
+  # NAT) or "private" (oss-<region>-internal over the dedicated line; needs
+  # the TR's oss-* internal-endpoint statics routable from the edge - proven
+  # on the UAT cluster 2026-07-26). Flips BOTH the edgeadm binary host and the
+  # node-spec imageRepoType. Invalid values fail the provider at startup.
+  IMAGE_REPO_TYPE: {{ .Values.provider.imageRepoType | default "public" | quote }}
+  # stale-Node cleanup (v0.1.19, T7 finding): delete Node objects whose
+  # instance is CONFIRMED gone (uncached describe) after NotReady >= grace.
+  # Reversible (live kubelets re-register), so default ON - unlike
+  # JANITOR_RELEASE. Capped at 2 deletions per tick.
+  JANITOR_NODE_CLEANUP: {{ .Values.provider.janitorNodeCleanup | default "true" | quote }}
+  NODE_CLEANUP_GRACE: {{ .Values.provider.nodeCleanupGrace | default "5m" | quote }}
+  JOIN_TIMEOUT: {{ .Values.provider.joinTimeout | default "30m" | quote }}
+  # join-token validity (v0.1.23): sets the attach token's absolute
+  # expiry on DescribeClusterAttachScripts. "0" omits the field (Alibaba's
+  # documented 1h default applies); domain otherwise [1h, 24h]. The provider
+  # fails startup on invalid values.
+  JOIN_TOKEN_TTL: {{ .Values.provider.joinTokenTtl | default "2h" | quote }}
+  JANITOR_RELEASE: {{ .Values.provider.janitorRelease | default "false" | quote }}
+  METRICS_ADDR: {{ .Values.provider.metricsAddr | default "0.0.0.0:9090" | quote }}
+  # readiness (v0.1.16, Issue 3): the K8s-reachability controller's cadence and
+  # per-check budget (positive durations; envDuration FATAL-exits on <=0).
+  READINESS_CHECK_INTERVAL: {{ .Values.provider.readinessCheckInterval | default "10s" | quote }}
+  READINESS_CHECK_TIMEOUT: {{ .Values.provider.readinessCheckTimeout | default "5s" | quote }}
+  ALIBABA_CLOUD_ROLE_ARN: {{ .Values.rrsa.roleArn | quote }}
+  ALIBABA_CLOUD_OIDC_PROVIDER_ARN: {{ .Values.rrsa.oidcProviderArn | quote }}
+  ALIBABA_CLOUD_OIDC_TOKEN_FILE: {{ .Values.rrsa.oidcTokenFile | quote }}
+{{- if .Values.provider.leaderElection.enabled }}
+  # Active-passive HA (v0.1.25): Lease election on the constant
+  # lease `ens-provider-leader` (name is shared with the RBAC resourceNames —
+  # deliberately NOT a knob, C-08). POD_NAME/POD_NAMESPACE arrive via the
+  # downward API on the Deployment.
+  LEADER_ELECT: "true"
+  LEADER_LEASE_DURATION: {{ .Values.provider.leaderElection.leaseDuration | quote }}
+  LEADER_RENEW_DEADLINE: {{ .Values.provider.leaderElection.renewDeadline | quote }}
+  LEADER_RETRY_PERIOD: {{ .Values.provider.leaderElection.retryPeriod | quote }}
+{{- end }}
+{{- if not .Values.edgeGroups }}{{ fail "edgeGroups is required (one entry per ENS edge nodepool)" }}{{- end }}
+  # ---- MULTI-GROUP: one CA node group per ENS edge nodepool (snake_case keys
+  #      so the provider parses them directly). ----
+  NODE_GROUPS: {{ .Values.edgeGroups | toJson | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ens-provider
+  namespace: {{ $ns }}
+  labels: { app: ens-provider }
+spec:
+{{- if .Values.provider.leaderElection.enabled }}
+  # HA: only the pod carrying the leader label is a backend — the elected
+  # leader patches its own pod on acquisition (and purges the label on
+  # container start, so a restarted demoted pod never re-enters). CA's
+  # cloud-config address is unchanged; membership follows the label (C-14).
+  selector: { app: ens-provider, ens-provider.io/role: leader }
+{{- else }}
+  selector: { app: ens-provider }
+{{- end }}
+  ports:
+    - { name: grpc, port: 8086, targetPort: 8086 }
+    - { name: metrics, port: 9090, targetPort: 9090 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ens-provider
+  namespace: {{ $ns }}
+  labels: { app: ens-provider, autoscaler/component: ca-provider }
+spec:
+{{- if .Values.provider.leaderElection.enabled }}
+  # HA : 2 replicas, active-passive. RollingUpdate converges because
+  # BOTH pods are kubelet-Ready (readiness is NOT leadership-gated, C-14);
+  # replacing the old leader costs one graceful handoff (~seconds). The
+  # surge pod needs a third provider-free cloud node — with one down the
+  # rollout stalls VISIBLY while both old pods keep serving.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+{{- else }}
+  replicas: 1
+  strategy: { type: Recreate }
+{{- end }}
+  selector: { matchLabels: { app: ens-provider } }
+  template:
+    metadata:
+      {{- if .Values.provider.podLabels }}
+      labels:
+        app: ens-provider
+        {{- toYaml .Values.provider.podLabels | nindent 8 }}
+      {{- else }}
+      labels: { app: ens-provider }
+      {{- end }}
+      annotations:
+        # covers EVERYTHING the env ConfigMap renders from — a config-only
+        # change must roll the pod (env vars snapshot at container start;
+        # learned 2026-07-16 when a diskCategory fix silently didn't apply).
+        # The leaderElection subtree is EXCLUDED while disabled (C-07): merely ADDING the values block must not roll flag-off
+        # consumers; once enabled its edits must roll the pods, so it is
+        # included. (toJson sorts map keys, so omit-then-hash is stable.)
+{{- if .Values.provider.leaderElection.enabled }}
+        checksum/config: {{ list (.Values.edgeGroups | toJson) (.Values.ens | toJson) (.Values.rrsa | toJson) (.Values.provider | toJson) (.Values.cluster | toJson) | join "|" | sha256sum | trunc 16 }}
+{{- else }}
+        checksum/config: {{ list (.Values.edgeGroups | toJson) (.Values.ens | toJson) (.Values.rrsa | toJson) (omit .Values.provider "leaderElection" "podLabels" | toJson) (.Values.cluster | toJson) | join "|" | sha256sum | trunc 16 }}
+{{- end }}
+    spec:
+      serviceAccountName: ens-provider
+      # faster recovery from node failure (F-05 / backlog item 17, chosen
+      # 120s): the default 300s NoExecute toleration strands the
+      # provider ~5-6 min on a dead node; 120s halves that without the
+      # restart-churn a 30-60s value risks during transient partitions.
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 120 }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 120 }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: alibabacloud.com/is-edge-worker, operator: NotIn, values: ["true"] }
+{{- if .Values.provider.leaderElection.enabled }}
+        # HA: never two provider pods on one node (hard), one per zone
+        # (hard — DoNotSchedule: ScheduleAnyway would never rebalance back
+        # to 1a/1b after a zone recovers, C-12 ruling; accepted
+        # degradation = 1 replica while the single 1b node is down).
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: { app: ens-provider }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: ens-provider }
+{{- end }}
+      containers:
+        # Go externalgrpc server (this repository): static distroless image, no
+        # runtime installs. RRSA/OIDC is resolved by credentials-go straight
+        # from the ALIBABA_CLOUD_* env vars in ens-provider-config — no aliyun
+        # CLI, no config.json, no `mode: OIDC` gotcha.
+        - name: ens-provider
+          image: {{ .Values.provider.image }}
+          envFrom:
+            - configMapRef: { name: ens-provider-config }
+{{- if .Values.provider.leaderElection.enabled }}
+          # downward-API identity: the election identity AND the label-patch
+          # target. The provider FATAL-exits if these are missing with
+          # LEADER_ELECT=true.
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+{{- end }}
+          ports:
+            - { name: grpc, containerPort: 8086 }
+            - { name: metrics, containerPort: 9090 }
+          volumeMounts:
+            - { name: sts-token, mountPath: /var/run/secrets/tokens, readOnly: true }
+          # readiness = the gRPC health service (config parsed + serving);
+          # liveness stays process-focused (tcp) so a cloud-API blip can never
+          # restart the only replica (design record §12.5)
+          # readiness observes the gRPC health status, which is now gated on
+          # Kubernetes reachability (Issue 3). failureThreshold: 1 — the health
+          # status is already authoritative and the controller bounds its own
+          # outage-detection budget (interval + per-check timeout); extra kubelet
+          # retries would only leave a dead provider Ready longer (C-009). No
+          # timeoutSeconds: the health RPC is local/fast and the K8s call is
+          # bounded inside the controller.
+          readinessProbe:
+            grpc: { port: 8086 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 1
+          # liveness is process-only and INDEPENDENT of Kubernetes — a K8s
+          # outage must make us NotReady, never restart the single replica.
+          livenessProbe:
+            tcpSocket: { port: grpc }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          resources: {{- toYaml .Values.provider.resources | nindent 12 }}
+      volumes:
+        - name: sts-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: sts-token
+                  audience: sts.aliyuncs.com
+                  expirationSeconds: 3600

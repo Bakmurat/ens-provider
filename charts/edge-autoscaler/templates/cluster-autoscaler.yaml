@@ -1,0 +1,122 @@
+{{- $ns := .Values.namespace -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-cloud-config
+  namespace: {{ $ns }}
+  labels: { app: cluster-autoscaler }
+data:
+  cloud-config.yaml: |
+    address: "ens-provider.{{ $ns }}.svc.cluster.local:8086"
+    grpc_timeout: {{ .Values.autoscaler.grpcTimeout | default "30s" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: {{ $ns }}
+  labels: { app: cluster-autoscaler, autoscaler/component: ca-core }
+spec:
+  replicas: {{ .Values.autoscaler.replicas }}
+  selector: { matchLabels: { app: cluster-autoscaler } }
+  template:
+    metadata:
+      {{- if .Values.autoscaler.podLabels }}
+      labels:
+        app: cluster-autoscaler
+        {{- toYaml .Values.autoscaler.podLabels | nindent 8 }}
+      {{- else }}
+      labels: { app: cluster-autoscaler }
+      {{- end }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8085"
+    spec:
+      serviceAccountName: cluster-autoscaler
+      priorityClassName: system-cluster-critical
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: alibabacloud.com/is-edge-worker, operator: NotIn, values: ["true"] }
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app: cluster-autoscaler }
+      # REQUIRED zone spread (C-16 / backlog item 17): the CA pair's
+      # 1a/1b split was fortunate scheduling, not a guarantee — the
+      # anti-affinity above is preferred+hostname only. maxSkew 1 forces
+      # cross-zone; a single-zone cluster has one eligible domain,
+      # so the constraint is trivially satisfied there.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: cluster-autoscaler }
+      containers:
+        - name: cluster-autoscaler
+          image: {{ .Values.autoscaler.image }}
+          command:
+            - ./cluster-autoscaler
+            - --cloud-provider=externalgrpc
+            - --cloud-config=/config/cloud-config.yaml
+            - --namespace={{ $ns }}
+            - --leader-elect=true
+            - --leader-elect-resource-lock=leases
+            - --leader-elect-lease-duration=15s
+            - --leader-elect-renew-deadline=10s
+            - --leader-elect-retry-period=2s
+            - --scan-interval={{ .Values.autoscaler.scanInterval }}
+            # proactively bring each node group up to its min size (warm floors:
+            # system/istio min=1). Without this, CA treats min only as a
+            # scale-DOWN floor and never fills a 0-node group that has min>0.
+            - --enforce-node-group-min-size=true
+            - --scale-down-enabled=true
+            - --scale-down-delay-after-add={{ .Values.autoscaler.scaleDownDelayAfterAdd }}
+            - --scale-down-unneeded-time={{ .Values.autoscaler.scaleDownUnneededTime }}
+            # INVARIANT I3: unready-time > provider NODE_AUTONOMY_DURATION (10m),
+            # or a partial line flap releases nodes autonomy just protected.
+            - --scale-down-unready-time={{ .Values.autoscaler.scaleDownUnreadyTime }}
+            # unready circuit breaker made explicit (defaults; a FULL line cut
+            # trips these and halts all CA operations until the line returns)
+            - --max-total-unready-percentage=45
+            - --ok-total-unready-count=3
+            - --max-node-provision-time={{ .Values.autoscaler.maxNodeProvisionTime }}
+            - --expander=least-waste
+            - --skip-nodes-with-system-pods=false
+            - --skip-nodes-with-local-storage=false
+            - --balance-similar-node-groups=false
+            - --stderrthreshold=info
+            - --logtostderr=true
+            - --v=4
+          ports:
+            # CA serves BOTH /metrics and /health-check on --address (default :8085)
+            - { name: metrics, containerPort: 8085 }
+          livenessProbe:
+            httpGet: { path: /health-check, port: 8085 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+          volumeMounts:
+            - { name: cloud-config, mountPath: /config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }   # writable scratch (readOnlyRootFilesystem below)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "100m", memory: "300Mi" }
+            limits:   { cpu: "500m", memory: "600Mi" }
+      volumes:
+        - name: cloud-config
+          configMap: { name: cluster-autoscaler-cloud-config }
+        - name: tmp
+          emptyDir: {}

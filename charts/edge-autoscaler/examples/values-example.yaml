@@ -1,0 +1,21 @@
+# Example per-cluster values for the edge-autoscaler chart. Every value here is a
+# placeholder; replace with your own cluster facts (for example from Terraform outputs).
+cluster:
+  id: "c-example0123456789"
+  region: ap-southeast-1
+rrsa:
+  roleArn: "acs:ram::123456789012:role/ens-provider-example"
+  oidcProviderArn: "acs:ram::123456789012:oidc-provider/ack-rrsa-c-example0123456789"
+provider:
+  image: "registry.example.com/ens-provider:v0.1.28"
+ens:
+  region: ens-region-1
+edgeGroups:
+  - id: "np-example-web"
+    nodepool_id: "np-example-web"
+    name_prefix: "example-web"
+    min: 0
+    max: 5
+    instance_type: "ens.sn1.small"
+    labels: { tier: web }
+    taints: [ { key: tier, value: web, effect: NoSchedule } ]
