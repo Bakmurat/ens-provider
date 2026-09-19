@@ -1,15 +1,44 @@
 # ens-provider
 
-A [Kubernetes Cluster Autoscaler `externalgrpc`](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler/cloudprovider/externalgrpc)
-cloud provider for **Alibaba Cloud ENS edge node pools** in **ACK@Edge** clusters.
+**Autoscaling for the edge node pools Alibaba Cloud does not autoscale.**
 
-ENS edge node pools have no native autoscaling: the vendor's Cluster Autoscaler
-supports only central ESS pools, and Karpenter has no ENS provider. `ens-provider`
-fills that gap. It reuses the upstream Cluster Autoscaler core unchanged
-(batching, expanders, PDB-aware draining, backoff, metrics) and implements only
-the ENS-specific node-group operations behind the `externalgrpc` contract, so
-the autoscaler is never forked. One Cluster Autoscaler node group maps to one
-ENS edge nodepool. Single static binary, distroless image.
+`ens-provider` is a [Kubernetes Cluster Autoscaler `externalgrpc`](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler/cloudprovider/externalgrpc)
+cloud provider for **Alibaba Cloud ENS edge node pools** in **ACK@Edge** clusters. ENS edge pools ship with no
+autoscaling at all: the vendor's Cluster Autoscaler supports only central ESS pools, and Karpenter has no ENS
+provider. Until now, edge capacity had to be pinned by hand, which means paying for idle edge nodes around the
+clock or being caught short at the one place where latency matters most. `ens-provider` gives ENS pools the full
+Cluster Autoscaler experience: autonomous scale-up and scale-down, scale-from-zero, PDB-aware draining, expanders,
+backoff, and metrics, with the upstream autoscaler left completely unforked.
+
+Author: Bakmurat Kubanaliev. License: Apache-2.0 (see `LICENSE` and `NOTICE`).
+
+## Why it matters
+
+- **Edge is where the traffic lands.** Regional edge sites serve the latency-critical path. A capacity miss there is
+  visible to users immediately; a capacity surplus there is billed by the hour, per site.
+- **Cloud economics only work if release is real.** An autoscaler that deletes a Node but leaves the paid instance
+  behind saves nothing. `ens-provider` releases the ENS instance first and deletes the Node only after the cloud
+  accepts the release, and the billing stop was verified against the cloud's own records.
+- **Correctness under eventual consistency.** The ENS inventory API lags behind orders. Every guard in this provider
+  exists because a naive implementation over-orders in exactly that window. The residual failure direction is
+  deliberately safe: temporary under-scaling, never a pool above its ceiling.
+- **Nothing forked.** One Cluster Autoscaler node group maps to one ENS nodepool behind the `externalgrpc` contract,
+  so upstream fixes and features arrive without a merge.
+
+## Capabilities
+
+| Capability | What it delivers |
+|---|---|
+| **In-flight capacity accounting** | `TargetSize` counts joined plus in-flight instances, so the autoscaler never overshoots during the boot-and-join window; booted-but-unjoined instances report as `creating`. |
+| **Three-layer ceiling guard** | Advisory fast-fail on the cached count, authoritative re-check under a per-group order lock, and in-memory reservations for orders ENS has accepted but not yet listed. |
+| **Transactional scale-down** | Release the ENS instance first, delete the Node second; cross-group deletes refused; not-found releases treated as idempotent success so retried batches converge. |
+| **Janitor** | Alerts on ordered-but-never-joined instances; opt-in release of stranded paid instances; reversible reaping of stale Node objects whose instance is confirmed gone. |
+| **Scale-from-zero** | Measured node templates per group (CPU, memory, pods, ephemeral storage, allocatable) let the autoscaler plan capacity for an empty pool; pod capacity capped by the node CIDR mask, not the SKU. |
+| **Active-passive HA** | Two replicas on a coordination Lease, fail-closed gRPC interceptors on the follower, leader-label Service routing, quiescence-gated lease handoff on shutdown. |
+| **Kubernetes-gated readiness** | Only Kubernetes API reachability gates readiness; cloud hiccups are a metrics concern and never trigger restarts. |
+| **Secret hygiene** | Every SDK error scrubbed at the boundary (STS tokens, signatures, userdata), attach tokens scrubbed from join logs, bounded SDK timeouts. |
+| **Supply-chain posture** | Single static binary, distroless non-root image, vendored upstream protobuf stubs with provenance, 125 tests run under the race detector. |
+| **Observability** | Zero-dependency Prometheus metrics for orders, releases, reservations, ownership, and leadership; ISO-8601 UTC logs. |
 
 ```
 ┌────────────────────┐  gRPC (externalgrpc)  ┌──────────────────┐
@@ -24,16 +53,20 @@ ENS edge nodepool. Single static binary, distroless image.
                                        via edgeadm userdata → Nodes)
 ```
 
-## Status
+## Proven on a live cluster
 
-Version line `v0.1.x`. Verified on a live UAT cluster of the Vietnam edge
-platform, August 2026: autonomous scale-up and scale-down of edge pools,
-scale-from-zero, active-passive failover, and clean release of edge instances
-were exercised end to end. Treat it as pre-production software: read the
-design notes below, run the test suite, and validate it in your own
-environment before relying on it.
+`ens-provider` was verified end to end on a live ACK@Edge cluster (control plane in Alibaba Cloud Singapore, edge
+workers at an ENS site in Vietnam) in July and August 2026, across 16 tagged releases (v0.1.13 to v0.1.28):
 
-Author: Bakmurat Kubanaliev. License: Apache-2.0 (see `LICENSE` and `NOTICE`).
+| Drill | Result |
+|---|---|
+| First autonomous scale-up of an edge pool | 24 July 2026 |
+| Acceptance suite (scale-up, scale-down, scale-from-zero, ceiling, failure injection) | 9 of 9 scenarios passed |
+| HA failover: leader pod deleted / SIGKILL / node drain / rolling update | takeover in 2.1 s / ~4.5 s / 2.0 s / 1.5 s, zero autoscaler errors |
+| End-to-end drill: pool 0 → 2 → 0 | autoscaler decision 7 s after the trigger; pods Running 3 min 44 s after the trigger; HA takeover ~2.6 s; ENS billing stop confirmed in the cloud's records 12 min 45 s after scale-down; cluster byte-identical to its baseline afterwards |
+
+The `v0.1.x` line is what those drills ran. Run the test suite and validate against your own pools before rollout;
+the design notes below explain every non-obvious decision.
 
 ## How it works
 
