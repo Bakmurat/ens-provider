@@ -18,10 +18,14 @@ Author: Bakmurat Kubanaliev. License: Apache-2.0 (see `LICENSE` and `NOTICE`).
   visible to users immediately; a capacity surplus there is billed by the hour, per site.
 - **Cloud economics only work if release is real.** An autoscaler that deletes a Node but leaves the paid instance
   behind saves nothing. `ens-provider` releases the ENS instance first and deletes the Node only after the cloud
-  accepts the release, and the billing stop was verified against the cloud's own records.
+  accepts the release; in the August 2026 drill both instances were confirmed gone from the ENS
+  inventory, which is what stops pay-as-you-go billing.
 - **Correctness under eventual consistency.** The ENS inventory API lags behind orders. Every guard in this provider
   exists because a naive implementation over-orders in exactly that window. The residual failure direction is
-  deliberately safe: temporary under-scaling, never a pool above its ceiling.
+  deliberately safe within one provider process: a stale reservation can only under-scale
+  temporarily. The documented residual gap is a provider restart inside the cloud's
+  visibility window, which loses the in-memory reservations and can allow an order above the
+  ceiling; closing it needs durable or shared state (see `reservations.go`).
 - **Nothing forked.** One Cluster Autoscaler node group maps to one ENS nodepool behind the `externalgrpc` contract,
   so upstream fixes and features arrive without a merge.
 
@@ -29,7 +33,7 @@ Author: Bakmurat Kubanaliev. License: Apache-2.0 (see `LICENSE` and `NOTICE`).
 
 | Capability | What it delivers |
 |---|---|
-| **In-flight capacity accounting** | `TargetSize` counts joined plus in-flight instances, so the autoscaler never overshoots during the boot-and-join window; booted-but-unjoined instances report as `creating`. |
+| **In-flight capacity accounting** | `TargetSize` counts joined plus in-flight instances, so the autoscaler does not overshoot during the boot-and-join window (guarantee scoped to one provider process, see the ceiling guard); booted-but-unjoined instances report as `creating`. |
 | **Three-layer ceiling guard** | Advisory fast-fail on the cached count, authoritative re-check under a per-group order lock, and in-memory reservations for orders ENS has accepted but not yet listed. |
 | **Transactional scale-down** | Release the ENS instance first, delete the Node second; cross-group deletes refused; not-found releases treated as idempotent success so retried batches converge. |
 | **Janitor** | Alerts on ordered-but-never-joined instances; opt-in release of stranded paid instances; reversible reaping of stale Node objects whose instance is confirmed gone. |
@@ -56,14 +60,15 @@ Author: Bakmurat Kubanaliev. License: Apache-2.0 (see `LICENSE` and `NOTICE`).
 ## Proven on a live cluster
 
 `ens-provider` was verified end to end on a live ACK@Edge cluster (control plane in Alibaba Cloud Singapore, edge
-workers at an ENS site in Vietnam) in July and August 2026, across 16 tagged releases (v0.1.13 to v0.1.28):
+workers at an ENS site in Vietnam) in July and August 2026, across 16 versioned releases (v0.1.13 to v0.1.28, as recorded in the release ledger; the git history carries tags for v0.1.28 only):
 
 | Drill | Result |
 |---|---|
 | First autonomous scale-up of an edge pool | 24 July 2026 |
 | Acceptance suite (scale-up, scale-down, scale-from-zero, ceiling, failure injection) | 9 of 9 scenarios passed |
-| HA failover: leader pod deleted / SIGKILL / node drain / rolling update | takeover in 2.1 s / ~4.5 s / 2.0 s / 1.5 s, zero autoscaler errors |
-| End-to-end drill: pool 0 → 2 → 0 | autoscaler decision 7 s after the trigger; pods Running 3 min 44 s after the trigger; HA takeover ~2.6 s; ENS billing stop confirmed in the cloud's records 12 min 45 s after scale-down; cluster byte-identical to its baseline afterwards |
+| HA drills: leader pod deleted / node drain / rolling update | standby took over in 2.1 s / 2.0 s / 1.5 s, zero autoscaler errors |
+| HA drill: leader SIGKILL | the same pod restarted and re-acquired leadership in ~4.5 s (a crash takeover by the standby was not exercised) |
+| End-to-end drill: pool 0 → 2 → 0 | autoscaler decision 7 s after the trigger; pods Running 3 min 44 s after the trigger; HA takeover ~2.6 s; both instances released and absent from the ENS inventory 12 min 45 s after the workload was deleted (including the 10-minute unneeded window), so pay-as-you-go billing stopped; cluster byte-identical to its baseline afterwards |
 
 The `v0.1.x` line is what those drills ran. Run the test suite and validate against your own pools before rollout;
 the design notes below explain every non-obvious decision.
@@ -75,14 +80,16 @@ the design notes below explain every non-obvious decision.
   script that downloads `edgeadm` and joins the node into the right ACK
   nodepool with the group's labels and taints. **In-flight capacity
   accounting:** `TargetSize` equals owned instances (joined plus in-flight), so
-  the autoscaler never overshoots during the boot-and-join window; booted but
+  the autoscaler does not overshoot during the boot-and-join window; booted but
   unjoined instances are reported as `creating`.
 - **Ceiling guard, three layers.** An advisory fast-fail on the cached count,
   then an authoritative re-check under the per-group order lock on a fresh
   inventory, plus **in-memory reservations** for orders that ENS has accepted
   but that are not yet visible to `Describe` (ENS inventory is eventually
   consistent). The residual failure direction is deliberately safe: temporary
-  under-scaling, never a pool above `max`. See `reservations.go`.
+  under-scaling from a stale reservation, never a pool above `max` from that path. A
+  provider restart inside the visibility window loses the reservations and can allow
+  over-ordering; that residual gap is documented in `reservations.go`.
 - **Transactional scale-down.** `NodeGroupDeleteNodes` is transactional per
   node: cross-group deletes are refused, the ENS instance is released
   **first**, and the Node object is deleted only after ENS accepts the
